@@ -1,7 +1,7 @@
 /**
  *  ecobee Smart Circulation
  *
- *  Copyright 2017 Barry A. Burke
+ *  Copyright 2017 Barry A. Burke 
  *
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
