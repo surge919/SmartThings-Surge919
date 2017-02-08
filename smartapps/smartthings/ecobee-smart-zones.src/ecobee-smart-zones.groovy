@@ -14,7 +14,7 @@
  *  for the specific language governing permissions and limitations under the License.
  *
  *  Written by Barry A. Burke (storageanarchy@gmail.com)
- *  Written: 2017-01-28
+ *  Written: 2017-01-28 
  *	https://github.com/SANdood/Ecobee/
  *	0.1.1 -	Beta Release
  */
