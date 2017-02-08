@@ -1,7 +1,7 @@
 /**
  *  ecobee Routines
  *
- *  Copyright 2015 Sean Kendall Schneyer
+ *  Copyright 2015 Sean Kendall Schneyer 
  *
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
