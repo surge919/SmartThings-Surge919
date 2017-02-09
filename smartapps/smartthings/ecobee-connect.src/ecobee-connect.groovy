@@ -52,10 +52,12 @@
  *	0.10.15- Converted heat/cool ranges to C when appropriate
  *	0.10.16- Proactively refresh the AuthToken if the expiration time is less than the watchdog schedule
  *	0.10.17- Optimized sunrise/sunset handling, watchdogInterval and updateThermostat map creation 
+ *	0.10.18- Still more optimizations
+ *	0.10.19- Revamped watchdog's refreshAuthToken strategy
  *
  *
  */  
-def getVersionNum() { return "0.10.17" }
+def getVersionNum() { return "0.10.19" }
 private def getVersionLabel() { return "Ecobee (Connect) Version ${getVersionNum()}" }
 private def getHelperSmartApps() {
 	return [ 
@@ -991,7 +993,7 @@ def userDefinedEvent(evt) {
     atomicState.lastUserDefinedEvent = now()
     atomicState.lastUserDefinedEventDate = getTimestamp()
     
-	if ( ((now() - atomicState.lastUserDefinedEvent) / 1000 / 60) < 3 ) { 
+	if ( ((now() - atomicState.lastUserDefinedEvent) / 60000) < 3 ) { 
     	LOG("userDefinedEvent() - polled, but time since last event is less than 3 minutes. Exiting without performing additional actions.", 4)
     	return 
  	}    
@@ -999,37 +1001,35 @@ def userDefinedEvent(evt) {
 }
 
 def scheduleWatchdog(evt=null, local=false) {
-	def results = true    
-    LOG("scheduleWatchdog() called with: evt (${evt?.name}:${evt?.value}) & local (${local})", 4, null, "trace")
+	def results = true  
+    if (debugLevel(4)) {
+    	def evtStr = evt ? "${evt.name}:{$evt.value}" : 'null'
+    	LOG("scheduleWatchdog() called with evt (${evtStr}) & local (${local})", 4, null, "trace")
+    }
+    
     // Only update the Scheduled timestamp if it is not a local action or from a subscription
     if ( (evt == null) && (local==false) ) {
     	atomicState.lastScheduledWatchdog = now()
         atomicState.lastScheduledWatchdogDate = getTimestamp()
         atomicState.getWeather = true								// next pollEcobeeApi for runtime changes should also get the weather object
-        
-        // check if token is going to expire within the next 15+ minutes (before the next scheduled watchdog) - if so, refresh it now to avoid the errors
-		// IMPORTANT: Token expires in 59 minutes & 59 seconds. By setting watchdogInterval to 14 minutes, we will refresh it after 56 minutes.
-		// This maximizes the useful lifetime of the token, and minimizes calls to refresh it.
-        def expiry = atomicState.authTokenExpires ? atomicState.authTokenExpires - now() : 1
-        LOG("scheduleWatchdog() - token expires in ${expiry/60000} minutes",4,"",'trace')
-    	if (expiry <= (atomicState.watchdogInterval*60500)) { 
-    		LOG("scheduleWatchdog() - preemptive call to refreshAuthToken(), ${expiry/60000} minutes to expiry",4,"",'trace')
-        	refreshAuthToken()
-    	}
 	}
     
     // Check to see if we have called too soon
-    def timeSinceLastWatchdog = (now() - atomicState.lastWatchdog) / 1000 / 60
+    def timeSinceLastWatchdog = (now() - atomicState.lastWatchdog) / 60000
     if ( timeSinceLastWatchdog < 1 ) {
     	LOG("It has only been ${timeSinceLastWatchdog} since last scheduleWatchdog was called. Please come back later.", 4, null, "trace")
         return true
     }
-    
+   
     atomicState.lastWatchdog = now()
     atomicState.lastWatchdogDate = getTimestamp()
+    def pollAlive = isDaemonAlive("poll")
+    def watchdogAlive = isDaemonAlive("watchdog")
+    def expiry = atomicState.authTokenExpires ? atomicState.authTokenExpires - now() : 150000
+    def pollingInterval = getPollingInterval()
     
     LOG("After watchdog tagging",4,null,'trace')
-	if(apiConnected() == "lost") {
+	if (apiConnected() == 'lost') {
     	// Possibly a false alarm? Check if we can update the token with one last fleeting try...
         if( refreshAuthToken() ) { 
         	// We are back in business!
@@ -1038,25 +1038,17 @@ def scheduleWatchdog(evt=null, local=false) {
 			LOG("scheduleWatchdog() - Unable to schedule handlers do to loss of API Connection. Please ensure you are authorized.", 1, null, "error")
 			return false
 		}
-	}
-    
-	def pollAlive = isDaemonAlive("poll")
-    def watchdogAlive = isDaemonAlive("watchdog")
-    
+	} else if (expiry <= (((pollingInterval < 6) ? 6 : (pollingInterval + 1)) * 60000)) {		// We know we are called at the end of every scheduled poll
+    	LOG("scheduleWatchdog() - refreshing Token, ${String.format('%.2f',(expiry/60000))} minutes to expiry",3,"",'info')
+       	refreshAuthToken()
+    }
+
     LOG("scheduleWatchdog() --> pollAlive==${pollAlive}  watchdogAlive==${watchdogAlive}", 4, null, "debug")
     
     // Reschedule polling if it has been a while since the previous poll    
     if (!pollAlive) { spawnDaemon("poll") }
-    if (!watchdogAlive) { 
-        // check if token is going to expire within the next 15+ minutes (before the next scheduled watchdog) - if so, refresh it now to avoid the errors
-        def expiry = atomicState.authTokenExpires ? atomicState.authTokenExpires - now() : 1
-    	if (expiry <= (atomicState.watchdogInterval*60500)) { 
-    		LOG("scheduleWatchdog() - preemptive call to refreshAuthToken(), ${expiry/60000} minutes to expiry (watchdog died)",4,"","trace")
-        	refreshAuthToken()
-    	}
-    	spawnDaemon("watchdog") 
-    }
-
+    if (!watchdogAlive) { spawnDaemon("watchdog") }
+    
     return true
 }
 
@@ -1068,26 +1060,29 @@ private def Boolean isDaemonAlive(daemon="all") {
 
 	daemon = daemon.toLowerCase()
     def result = true    
-    		
-    def timeSinceLastScheduledPoll = (atomicState.lastScheduledPoll == 0 || atomicState.lastScheduledPoll == null) ? 0 : ((now() - atomicState.lastScheduledPoll) / 1000 / 60)  // TODO: Removed toDouble() will this impact?
-    def timeSinceLastScheduledWatchdog = (atomicState.lastScheduledWatchdog == 0 || atomicState.lastScheduledWatchdog == null) ? 0 : ((now() - atomicState.lastScheduledWatchdog) / 1000 / 60)
-	def timeBeforeExpiry = atomicState.authTokenExpires ? ((atomicState.authTokenExpires - now()) / 1000 / 60) : 0
     
-    LOG("isDaemonAlive() - now() == ${now()} for daemon (${daemon})", 5, null, "trace")
-    LOG("isDaemonAlive() - Time since last poll? ${timeSinceLastScheduledPoll} -- atomicState.lastScheduledPoll == ${atomicState.lastScheduledPoll}", 4, null, "info")
-    LOG("isDaemonAlive() - Time since watchdog activation? ${timeSinceLastScheduledWatchdog} -- atomicState.lastScheduledWatchdog == ${atomicState.lastScheduledWatchdog}", 4, null, "info")
-    LOG("isDaemonAlive() - Time left (timeBeforeExpiry) until expiry (in min): ${timeBeforeExpiry}", 4, null, "info")
-        
+	LOG("isDaemonAlive() - now() == ${now()} for daemon (${daemon})", 5, null, "trace")
+	
+    // No longer running an auth Daemon, because we need the scheduler slot (max 4 scheduled things, poll + watchdog use 2)	
+	//def timeBeforeExpiry = atomicState.authTokenExpires ? ((atomicState.authTokenExpires - now()) / 60000) : 0
+    //LOG("isDaemonAlive() - Time left (timeBeforeExpiry) until expiry (in min): ${timeBeforeExpiry}", 4, null, "info")
+	
     if (daemon == "poll" || daemon == "all") {
+		def lastScheduledPoll = atomicState.lastScheduledPoll
+		def timeSinceLastScheduledPoll = (!lastSchedulePoll || (lastScheduledPoll == 0)) ? 0 : ((now() - lastScheduledPoll) / 60000)
+		LOG("isDaemonAlive() - Time since last poll? ${timeSinceLastScheduledPoll} -- lastScheduledPoll == ${lastScheduledPoll}", 4, null, "info")
     	LOG("isDaemonAlive() - Checking daemon (${daemon}) in 'poll'", 4, null, "trace")
         def maxInterval = pollingInterval + 2
         if ( timeSinceLastScheduledPoll >= maxInterval ) { result = false }
 	}	
     
     if (daemon == "watchdog" || daemon == "all") {
+		def lastScheduledWatchdog = atomicState.lastScheduledWatchdog
+	    def timeSinceLastScheduledWatchdog = (!lastScheduledWatchdog || (atomicState.lastScheduledWatchdog == 0)) ? 0 : ((now() - lastScheduledWatchdog) / 60000)
+		LOG("isDaemonAlive() - Time since watchdog activation? ${timeSinceLastScheduledWatchdog} -- lastScheduledWatchdog == ${lastScheduledWatchdog}", 4, null, "info")
     	LOG("isDaemonAlive() - Checking daemon (${daemon}) in 'watchdog'", 4, null, "trace")
         def maxInterval = atomicState.watchdogInterval + 2
-        LOG("isDaemonAlive(watchdog) - timeSinceLastScheduledWatchdog=(${timeSinceLastScheduledWatchdog})  Timestamps: (${atomicState.lastScheduledWatchdogDate}) (epic: ${atomicState.lastScheduledWatchdog}) now-(${now()})", 4, null, "trace")
+        LOG("isDaemonAlive(watchdog) - timeSinceLastScheduledWatchdog=(${timeSinceLastScheduledWatchdog})  Timestamps: (${atomicState.lastScheduledWatchdogDate}) (epic: ${lastScheduledWatchdog}) now-(${now()})", 4, null, "trace")
         if ( timeSinceLastScheduledWatchdog >= maxInterval ) { result = false }
     }
     
@@ -1142,16 +1137,7 @@ private def Boolean spawnDaemon(daemon="all", unsched=true) {
         try {
             if( unsched ) { unschedule("scheduleWatchdog") }
             if ( canSchedule() ) { 
-				def timeList = ['5','10','15','30']
-				def watchdogInterval = atomicState.watchdogInterval
-				if (timeList.contains("${watchdogInterval}")) {
-        			"runEvery${watchdogInterval}Minutes"("scheduleWatchdog")
-				} else {
-					int randomSeconds = rand.nextInt(59)
-					int randomMinutes = rand.nextInt(watchdogInterval.toInteger())
-					LOG("Using schedule instead of runEvery with scheduleWatchdog: ${watchdogInterval}", 4)
-					schedule("${randomSeconds} ${randomMinutes}/${watchdogInterval} * * * ?", "scheduleWatchdog")
-				}
+        		"runEvery${atomicState.watchdogInterval}Minutes"("scheduleWatchdog")
             	result = result && true
 			} else {
             	LOG("canSchedule() is NOT allowed or result already false! Unable to schedule daemon!", 1, null, "error")
@@ -1160,7 +1146,9 @@ private def Boolean spawnDaemon(daemon="all", unsched=true) {
         } catch (Exception e) {
         	LOG("spawnDaemon() - Exception when performing spawn for ${daemon}. Exception: ${e}", 1, null, "error")
             result = false
-        }		
+        }
+		atomicState.lastScheduledWatchdog = now()
+        atomicState.lastScheduledWatchdogDate = getTimestamp()
         atomicState.getWeather = true	// next pollEcobeeApi for runtime changes should also get the weather object
     }
     
@@ -1228,7 +1216,7 @@ def pollChildren(child = null) {
     String thermostatsToPoll = getChildThermostatDeviceIdsString()
     if (child == null) { // normal call
    		// Check to see if it is time to do an full poll to the Ecobee servers. If so, execute the API call and update ALL children
-    	timeSinceLastPoll = forcePoll ? 999.9 : ((now() - atomicState.lastPoll?.toDouble()) / 1000 / 60) 
+    	timeSinceLastPoll = forcePoll ? 999.9 : ((now() - atomicState.lastPoll?.toDouble()) / 60000) 
     	LOG("Time since last poll? ${timeSinceLastPoll} -- atomicState.lastPoll == ${atomicState.lastPoll}", 4, child, "info")
     
     	// Also, check if anything has changed in the thermostatSummary (really don't need to call EcobeeAPI if it hasn't).
@@ -2220,7 +2208,7 @@ private refreshAuthToken(child=null) {
 
                         
                         // Save the expiry time for debugging purposes
-                        LOG("refreshAuthToken() - Success! Token expires in ${resp?.data?.expires_in} seconds", 3, child, "info")
+                        LOG("refreshAuthToken() - Success! Token expires in ${String.format("%.2f",resp?.data?.expires_in/60)} minutes", 3, child, "info")
                         atomicState.authTokenExpires = (resp?.data?.expires_in * 1000) + now()
                         LOG("Updated state.authTokenExpires = ${atomicState.authTokenExpires}", 4, child, "trace")
 
@@ -2784,7 +2772,7 @@ private def  getMinMinBtwPolls() {
 	return 1
 }
 
-private def getPollingInterval() {
+private Integer getPollingInterval() {
 	// return (settings.pollingInterval?.toInteger() >= 5) ? settings.pollingInterval.toInteger() : 5
     return ((settings.pollingInterval && settings.pollingInterval.isNumber()) ? settings.pollingInterval.toInteger() : 5)
 }
